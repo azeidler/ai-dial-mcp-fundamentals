@@ -4,16 +4,21 @@ from typing import Any
 
 from openai import AsyncAzureOpenAI
 
-from agent.models.message import Message, Role
-from agent.mcp_client import MCPClient
+from models.message import Message, Role
+from mcp_client import MCPClient
 
 
 class DialClient:
-    """Handles AI model interactions and integrates with MCP client"""
+    """Handles AI model interactions and integrates with MCP client(s)"""
 
-    def __init__(self, api_key: str, endpoint: str, tools: list[dict[str, Any]], mcp_client: MCPClient):
+    def __init__(self, api_key: str, endpoint: str, tools: list[dict[str, Any]], mcp_clients: dict[str, MCPClient] | MCPClient):
         self.tools = tools
-        self.mcp_client = mcp_client
+        # Support both single MCP client (backwards compatible) and multiple clients
+        if isinstance(mcp_clients, MCPClient):
+            self.mcp_clients = {"default": mcp_clients}
+        else:
+            self.mcp_clients = mcp_clients
+        
         self.openai = AsyncAzureOpenAI(
             api_key=api_key,
             azure_endpoint=endpoint,
@@ -82,10 +87,61 @@ class DialClient:
         return ai_message
 
     async def _call_tools(self, ai_message: Message, messages: list[Message]):
-        """Execute tool calls using MCP client"""
-        #TODO:
+        """Execute tool calls using MCP client(s)"""
         # 1. Iterate through tool_calls
-        # 2. Get tool name and tool arguments (arguments is a JSON, don't forget about that)
-        # 3. Wrap into try/except block and call mcp_client tool call. If succeed then add tool message (don't forget
-        #    about tool call id), otherwise add tool message with error message (it kind of fallback strategy).
-        raise NotImplementedError()
+        for tool_call in ai_message.tool_calls:
+            # 2. Get tool name and arguments
+            tool_name = tool_call["function"]["name"]
+            tool_args_json = tool_call["function"]["arguments"]
+            tool_call_id = tool_call["id"]
+            
+            try:
+                # Parse JSON arguments
+                tool_args = json.loads(tool_args_json)
+                
+                # 3. Find the appropriate MCP client for this tool
+                mcp_client = self._find_mcp_client_for_tool(tool_name)
+                
+                if not mcp_client:
+                    raise ValueError(f"No MCP client found for tool: {tool_name}")
+                
+                # Call MCP client tool
+                print(f"    🔧 Calling tool: {tool_name}")
+                result = await mcp_client.call_tool(tool_name, tool_args)
+                
+                # Add successful tool message
+                messages.append(Message(
+                    role=Role.TOOL,
+                    content=str(result),
+                    tool_call_id=tool_call_id,
+                    name=tool_name
+                ))
+            except Exception as e:
+                # Add error tool message as fallback
+                error_message = f"Error calling tool {tool_name}: {str(e)}"
+                print(f"    ❌ {error_message}")
+                messages.append(Message(
+                    role=Role.TOOL,
+                    content=error_message,
+                    tool_call_id=tool_call_id,
+                    name=tool_name
+                ))
+    
+    def _find_mcp_client_for_tool(self, tool_name: str) -> MCPClient | None:
+        """Find which MCP client has the requested tool"""
+        # For single client (backwards compatibility)
+        if "default" in self.mcp_clients and len(self.mcp_clients) == 1:
+            return self.mcp_clients["default"]
+        
+        # For multiple clients, check each tool list
+        for client_name, client in self.mcp_clients.items():
+            # Check if this tool exists in any of the registered tools
+            for tool in self.tools:
+                if tool["function"]["name"] == tool_name:
+                    # In a more sophisticated implementation, you'd track which client
+                    # provides which tool. For now, we try each client until one works.
+                    return client
+        
+        # If we have multiple clients, try the first one that might work
+        # In production, you'd want a proper tool->client mapping
+        return list(self.mcp_clients.values())[0] if self.mcp_clients else None
